@@ -55,7 +55,13 @@ def history_indices(complete, max_gap):
     return windows[(np.diff(windows, axis=1) <= max_gap).all(axis=1)]
 
 
-def prepare_year(observations, year, max_gap):
+def extraterrestrial_horizontal(times):
+    zenith = solarposition.get_solarposition(times, 38.74, -121.19).zenith
+    return np.asarray(irradiance.get_extra_radiation(times) *
+                      np.cos(np.deg2rad(zenith)), dtype=np.float32)
+
+
+def prepare_year(observations, year, max_gap, *, minute_targets):
     times = pd.date_range(f"{year}-01-01", f"{year + 1}-01-01",
                           inclusive="left", freq="min", tz="UTC")
     table = observations.reindex(times)
@@ -65,14 +71,13 @@ def prepare_year(observations, year, max_gap):
     values = np.column_stack((table[IRR + MET], np.sin(hour), np.cos(hour),
                               np.sin(doy), np.cos(doy))).astype(np.float32)
     ghi = values[:, 0].copy()
-    zenith = solarposition.get_solarposition(times, 38.74, -121.19).zenith
-    i0 = np.asarray(irradiance.get_extra_radiation(times) *
-                    np.cos(np.deg2rad(zenith)), dtype=np.float32)
+    i0 = extraterrestrial_horizontal(times)
     daylight = np.isfinite(ghi) & (ghi > 10) & (i0 > 0)
     complete = np.isfinite(values).all(axis=1) & daylight
     windows = history_indices(complete, max_gap)
     windows = windows[windows[:, -1] + LEADS[-1] < len(times)]
-    windows = windows[daylight[windows[:, -1, None] + LEADS].all(axis=1)]
+    if minute_targets:
+        windows = windows[daylight[windows[:, -1, None] + LEADS].all(axis=1)]
     return times, values, ghi, i0, windows
 
 
@@ -126,17 +131,63 @@ def match_images(frames, times, issues, clock, age, limit):
     return rows, order[slots[rows]], issue_seconds[rows] - seconds[slots[rows]]
 
 
+def interpolate_targets(ghi, minutes, seconds):
+    fraction = seconds[:, None] / 60
+    # Exact-minute labels need only the exact observation.
+    later = minutes + (fraction > 0)
+    return (ghi[minutes] * (1 - fraction) + ghi[later] * fraction).astype(np.float32)
+
+
+def image_anchored_samples(frames, times, windows, ghi, limit):
+    if not frames.names:
+        raise ValueError(f"No JPEGs in {frames.root}")
+    ordered = np.lexsort((frames.names, frames.mtime))
+    unique_time = np.r_[True, np.diff(frames.mtime[ordered]) != 0]
+    frame_ids = ordered[unique_time]
+    year_start = times[0].value // 10**9
+    minutes, seconds = np.divmod(frames.mtime[frame_ids] - year_start, 60)
+    valid = (minutes >= 0) & (minutes + LEADS[-1] + (seconds > 0) < len(times))
+    lookup = np.full(len(times), -1, dtype=np.int64)
+    lookup[windows[:, -1]] = np.arange(len(windows))
+    frame_ids, minutes, seconds = frame_ids[valid], minutes[valid], seconds[valid]
+    rows = lookup[minutes]
+    valid = rows >= 0
+    frame_ids, minutes, seconds, rows = (x[valid] for x in (frame_ids, minutes, seconds, rows))
+    targets = interpolate_targets(ghi, minutes[:, None] + LEADS, seconds)
+    valid = (np.isfinite(targets) & (targets > 10)).all(axis=1)
+    frame_ids, rows, targets = (x[valid] for x in (frame_ids, rows, targets))
+    frame_times = pd.to_datetime(frames.mtime[frame_ids], unit="s", utc=True)
+    target_seconds = frames.mtime[frame_ids, None] + LEADS * 60
+    i0 = extraterrestrial_horizontal(pd.to_datetime(target_seconds.ravel(), unit="s", utc=True))
+    i0 = i0.reshape(-1, len(LEADS))
+    selected = np.flatnonzero((i0 > 0).all(axis=1))
+    if not len(selected):
+        raise ValueError(f"No valid image-anchored forecast samples in {frames.root}")
+    if limit and len(selected) > limit:
+        selected = selected[np.linspace(0, len(selected) - 1, limit, dtype=int)]
+    return rows[selected], frame_ids[selected], frame_times[selected], targets[selected], i0[selected]
+
+
+def write_clock_audit(frames, output):
+    filenames = pd.to_datetime([Path(name).stem for name in frames.names],
+                                format="%Y%m%d_%H%M%S", utc=True, errors="coerce")
+    modified = pd.to_datetime(frames.mtime, unit="s", utc=True)
+    offset = (filenames - modified).total_seconds()
+    daily = pd.DataFrame({"dm_utc_day": modified.normalize(), "fn_minus_dm_s": offset})
+    daily.groupby("dm_utc_day")["fn_minus_dm_s"].agg(
+        frames="size", parsed_filenames="count", min_s="min", median_s="median", max_s="max"
+    ).to_csv(output)
+
+
 class Folsom(Dataset):
-    def __init__(self, values, ghi, i0, windows, frames, frame_ids, scaler):
+    def __init__(self, values, windows, frames, frame_ids, scaler, targets, target_i0, issue_index):
         self.values = (values - scaler[0]) / scaler[1]
         self.windows = windows
         self.frames = frames
         self.frame_ids = frame_ids
-        issues = windows[:, -1]
-        targets = issues[:, None] + LEADS
-        self.targets = ghi[targets]
-        self.i0 = i0[targets]
-        self.baseline = ghi[issues, None] / i0[issues, None] * self.i0
+        self.targets = targets
+        self.i0 = target_i0
+        self.baseline = issue_index[:, None] * self.i0
 
     def __len__(self):
         return len(self.windows)
@@ -182,6 +233,7 @@ def main():
                         metavar=("CACHE_2014", "CACHE_2015", "CACHE_2016"))
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--image-clock", choices=["mtime", "filename"], default="mtime")
+    parser.add_argument("--issue-clock", choices=["minute", "image"], default="minute")
     parser.add_argument("--max-image-age", type=int, default=60)
     parser.add_argument("--max-history-gap", type=int, choices=[1, 2], default=1)
     parser.add_argument("--limit-per-year", type=int, default=0)
@@ -191,7 +243,11 @@ def main():
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--prepare-only", action="store_true",
+                        help="Write configuration, sample manifests and clock audits without training.")
     args = parser.parse_args()
+    if args.issue_clock == "image" and args.image_clock != "mtime":
+        parser.error("Image-anchored forecasts use archive mtime")
     if min(args.epochs, args.batch_size, args.threads) < 1 or min(
         args.limit_per_year, args.max_image_age, args.workers
     ) < 0:
@@ -211,11 +267,23 @@ def main():
     }
     (args.output / "config.json").write_text(json.dumps(config, default=str, indent=2))
     datasets, load, issue_times = [], [], []
+    minute_targets = args.issue_clock == "minute"
     for year, root in zip((2014, 2015, 2016), args.images or args.image_cache):
-        times, values, ghi, i0, windows = prepare_year(obs, year, args.max_history_gap)
+        times, values, ghi, i0, windows = prepare_year(obs, year, args.max_history_gap,
+                                                      minute_targets=minute_targets)
         frames = Frames(root, cached=args.image_cache is not None)
-        rows, frame_ids, ages = match_images(frames, times, windows[:, -1], args.image_clock,
-                                            args.max_image_age, args.limit_per_year)
+        if minute_targets:
+            rows, frame_ids, ages = match_images(frames, times, windows[:, -1], args.image_clock,
+                                                 args.max_image_age, args.limit_per_year)
+            issues = windows[rows, -1]
+            issue = times[issues]
+            target_rows = issues[:, None] + LEADS
+            targets, target_i0 = ghi[target_rows], i0[target_rows]
+        else:
+            rows, frame_ids, issue, targets, target_i0 = image_anchored_samples(
+                frames, times, windows, ghi, args.limit_per_year)
+            ages = np.zeros(len(rows), dtype=np.int64)
+            write_clock_audit(frames, args.output / f"clock_audit_{year}.csv")
         windows = windows[rows]
         issues = windows[:, -1]
         if year == 2014:
@@ -224,17 +292,21 @@ def main():
             std = training_rows.std(axis=0)
             std[std == 0] = 1
             scaler = (mean, std)
-        pd.DataFrame({"issue_utc": times[issues], "image": [frames.names[i] for i in frame_ids],
-                      "image_age_seconds": ages, "history_start_utc": times[windows[:, 0]],
+        pd.DataFrame({"issue_utc": issue, "image": [frames.names[i] for i in frame_ids],
+                      "image_age_seconds": ages, "history_end_utc": times[issues],
+                      "history_start_utc": times[windows[:, 0]],
                       "history_2min_gaps": (np.diff(windows, axis=1) == 2).sum(axis=1)
                       }).to_csv(args.output / f"samples_{year}.csv", index=False)
-        dataset = Folsom(values, ghi, i0, windows, frames, frame_ids, scaler)
+        dataset = Folsom(values, windows, frames, frame_ids, scaler, targets, target_i0,
+                         ghi[issues] / i0[issues])
         datasets.append(dataset)
-        issue_times.append(times[issues])
+        issue_times.append(issue)
         load.append(DataLoader(dataset, batch_size=args.batch_size, shuffle=year == 2014,
                                num_workers=args.workers))
         print(f"{year}: {len(dataset)} matched samples", flush=True)
 
+    if args.prepare_only:
+        return
     model = DBMF().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     schedule = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=2)

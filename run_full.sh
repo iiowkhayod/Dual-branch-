@@ -16,7 +16,7 @@ exec > >(tee "$output/run.log") 2>&1
 date -u +%FT%TZ
 if "$py" -u dbmf.py --raw "$raw" \
     --image-cache "$cache/2014" "$cache/2015" "$cache/2016" \
-    --image-clock mtime --max-image-age 60 --max-history-gap 2 \
+    --image-clock mtime --issue-clock image --max-history-gap 2 \
     --output "$output/result" --epochs 50 --seed 42 --workers 4 --device cuda; then
     status=0
 else

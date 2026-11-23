@@ -29,3 +29,18 @@ bash run_smoke.sh "$PWD/runs/smoke-01"
 ```
 
 `run.log` 记录数据准备及训练，`result/` 保存配置、逐年样本清单、检查点、逐起报时刻的预测及指标。不覆盖已有运行目录。已有完整解包图像时，可通过 `python dbmf.py --help` 指定全年图像目录、训练轮数和运行参数。
+
+## 单次全量主模型实验
+
+使用三年归档中所有匹配成功的样本，2014 年训练，2015 年按验证 MSE 选择权重，2016 年计算 DBMF 和 Smart Persistence 的 GHI 指标。固定种子 42，最多 50 轮，早停耐心 8 轮。保留 30 个有效历史观测，相邻观测间隔最多 2 分钟，未来标签仍严格取起报后 10、20、30 分钟。继续采用归档 mtime 向后匹配（最大帧龄 60 秒），三个目标均须满足白天阈值。论文未披露原始匹配脚本和共同集名单，当前筛选规则定义了本次全量实验的测试集。
+
+```bash
+raw=/root/data1/folsom_multimodal/data/raw
+cache="$PWD/full-cache-v1"
+for year in 2014 2015 2016; do
+    python cache_images.py "$raw/Folsom_sky_images_${year}.tar.bz2" "$cache/$year"
+done
+bash run_full.sh "$cache" "$PWD/runs/full-seed42"
+```
+
+缓存从归档依次解码 JPEG，并保存双线性缩放后的 `64×64` RGB uint8 及原始帧时间。缓存目录只有在整份归档成功读取后才会生成 `complete.json`。全量运行每 250 个训练批次打印进度，最终写入 `exit_code` 和完整评估产物。
